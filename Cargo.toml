@@ -1,0 +1,29 @@
+[package]
+name = "reverse_search_main"
+version = "0.0.1"
+edition = "2021"
+description = "Main function for reverse search"
+readme = "README.md"
+repository = "https://github.com/aurelienwaite/reverse_search_main"
+license = "MIT"
+
+include = [
+    "**/*.rs",
+    "Cargo.toml",
+]
+
+
+
+[dependencies]
+clap = { version = "4.2.1", features = ["derive"] }
+serde = { version = "1.0.159", features = ["serde_derive", "rc"] }
+serde_json = "1.0"
+anyhow = "1.0"
+log = "0.4"
+simplelog = "0.12.2"
+ndarray = { version = "0.15.6", features = ["serde"] } 
+ndarray-rand = "0.14.0"
+ndarray-stats = "0.5.1"
+itertools = "0.12.1"
+reverse_search = { path = "../reserve_search" }
+
