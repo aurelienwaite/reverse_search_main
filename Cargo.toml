@@ -22,8 +22,7 @@ anyhow = "1.0"
 log = "0.4"
 simplelog = "0.12.2"
 ndarray = { version = "0.15.6", features = ["serde"] } 
-ndarray-rand = "0.14.0"
-ndarray-stats = "0.5.1"
 itertools = "0.12.1"
+parquet = "51.0.0"
 reverse_search = { path = "../reserve_search" }
 
