@@ -187,12 +187,7 @@ fn main() -> Result<()> {
         return Ok(());
     });
 
-
-    let config = ReverseSearchConfig {
-        greedy_search: false,
-    };
-
-    reverse_search(&mut poly, config, writer_callback, labels_ref)?;
+    reverse_search(&mut poly, writer_callback)?;
     //write_polytope(&poly, &args.polytope_out)?;
     return Ok(());
 }
