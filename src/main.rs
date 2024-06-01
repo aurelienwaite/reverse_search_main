@@ -4,7 +4,7 @@ use log::{debug, info};
 use ndarray::prelude::*;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::RowAccessor;
-use reverse_search::{accuracy, reverse_search, Polytope, ReverseSearchConfig, ReverseSearchOut};
+use reverse_search::{reverse_search, Polytope, ReverseSearchConfig, ReverseSearchOut};
 use serde::{Deserialize, Serialize};
 use simplelog::*;
 use std::collections::{BTreeMap, HashMap};
@@ -174,8 +174,9 @@ fn main() -> Result<()> {
     let writer_callback = Box::new(|rs_out: ReverseSearchOut| {
         counter += 1;
         info!("Writing result {}", counter);
-        let accuracy = labels_ref.map(|l| {
-            accuracy(&rs_out.minkowski_decomp, l)
+        let accuracy = None.map(|l: &[usize]| {
+            1.
+            //accuracy(&rs_out.minkowski_decomp, l)
         }).unwrap_or(-1.);
         let output = Output {
             param: &rs_out.param,
