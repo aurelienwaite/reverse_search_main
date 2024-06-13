@@ -1,17 +1,25 @@
 use anyhow::{anyhow, Result};
 use clap::Parser;
+use core::future::Future;
+use futures::future::BoxFuture;
+use itertools::Itertools;
 use log::{debug, info};
 use ndarray::prelude::*;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::RowAccessor;
-use reverse_search::{reverse_search, Polytope, ReverseSearchConfig, ReverseSearchOut};
+use reverse_search::guided_search::Guide;
+use reverse_search::{reverse_search, Polytope, ReverseSearchOut, Searcher, StepResult, TreeIndex};
+use reverse_search_main::{GuideGenerator, ThreadPool};
 use serde::{Deserialize, Serialize};
 use simplelog::*;
-use std::collections::{BTreeMap, HashMap};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::BufReader;
 use std::io::BufWriter;
+use std::pin::{pin, Pin};
+use std::rc::Rc;
 use std::string::String;
 use std::vec::Vec;
 
@@ -140,6 +148,18 @@ fn write_polytope(poly_str: &Vec<FullPolytope>, out_filename: &String) -> Result
     return Ok(());
 }*/
 
+fn run_guided_search(polys: &mut [Polytope], labels: &[usize]) -> Result<()> {
+    for poly in &mut *polys {
+        poly.fill()?;
+    }
+    let search = Searcher::setup_reverse_search(polys)?;
+    let thread_pool = ThreadPool::new(4, search.clone());
+    let guide = Guide::new(&search, labels,  Some(42))?;
+    let generator = GuideGenerator{guide, labels: labels};
+    thread_pool.run(&generator, 20)?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     TermLogger::init(
         LevelFilter::Info,
@@ -169,26 +189,33 @@ fn main() -> Result<()> {
     let mut writer = BufWriter::new(states_out_file);
 
     let labels = args.labels.map(read_labels).transpose()?;
-    let labels_ref = labels.as_deref();
-    let mut counter = 0;
-    let writer_callback = Box::new(|rs_out: ReverseSearchOut| {
-        counter += 1;
-        info!("Writing result {}", counter);
-        let accuracy = None.map(|l: &[usize]| {
-            1.
-            //accuracy(&rs_out.minkowski_decomp, l)
-        }).unwrap_or(-1.);
-        let output = Output {
-            param: &rs_out.param,
-            minkowski_decomp: &rs_out.minkowski_decomp,
-            accuracy: accuracy
-        };
-        let out_string = serde_json::to_string(&output)? + "\n";
-        writer.write(out_string.as_bytes())?;
-        return Ok(());
-    });
+    match labels {
+        Some(labels) => run_guided_search(&mut poly, &labels),
+        None => {
+            let mut counter = 0;
+            let writer_callback = Box::new(|rs_out: ReverseSearchOut| {
+                counter += 1;
+                info!("Writing result {}", counter);
+                let accuracy = None
+                    .map(|l: &[usize]| {
+                        1.
+                        //accuracy(&rs_out.minkowski_decomp, l)
+                    })
+                    .unwrap_or(-1.);
+                let decomp = rs_out.minkowski_decomp_iter().collect_vec();
+                let output = Output {
+                    param: &rs_out.param,
+                    minkowski_decomp: &decomp,
+                    accuracy: accuracy,
+                };
+                let out_string = serde_json::to_string(&output)? + "\n";
+                writer.write(out_string.as_bytes())?;
+                return Ok(());
+            });
 
-    reverse_search(&mut poly, writer_callback)?;
-    //write_polytope(&poly, &args.polytope_out)?;
-    return Ok(());
+            reverse_search(&mut poly, writer_callback)?;
+            //write_polytope(&poly, &args.polytope_out)?;
+            Ok(())
+        }
+    }
 }
