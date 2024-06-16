@@ -9,7 +9,7 @@ use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::RowAccessor;
 use reverse_search::guided_search::Guide;
 use reverse_search::{reverse_search, Polytope, ReverseSearchOut, Searcher, StepResult, TreeIndex};
-use reverse_search_main::{GuideGenerator, ThreadPool};
+use reverse_search_main::{runner, ThreadPool};
 use serde::{Deserialize, Serialize};
 use simplelog::*;
 use std::cell::RefCell;
@@ -148,15 +148,25 @@ fn write_polytope(poly_str: &Vec<FullPolytope>, out_filename: &String) -> Result
     return Ok(());
 }*/
 
-fn run_guided_search(polys: &mut [Polytope], labels: &[usize]) -> Result<()> {
+fn run_guided_search(
+    polys: &mut [Polytope],
+    labels: &[usize],
+    mut writer_callback: Box<impl FnMut(ReverseSearchOut) -> Result<()>>,
+) -> Result<()> {
+    info!("Filling polytopes");
     for poly in &mut *polys {
         poly.fill()?;
     }
+    info!("Starting search");
     let search = Searcher::setup_reverse_search(polys)?;
     let thread_pool = ThreadPool::new(4, search.clone());
-    let guide = Guide::new(&search, labels,  Some(42))?;
-    let generator = GuideGenerator{guide, labels: labels};
-    thread_pool.run(&generator, 20)?;
+    let guide = Guide::new(&search, labels, Some(42))?;
+    let runner_res = runner(&thread_pool, &guide, 20)?;
+    for outputs in runner_res {
+        for output in outputs? {
+            writer_callback(output)?;
+        }
+    }
     Ok(())
 }
 
@@ -188,11 +198,35 @@ fn main() -> Result<()> {
     let states_out_file = File::create(&args.reserve_search_out)?;
     let mut writer = BufWriter::new(states_out_file);
 
+    let mut counter = 0;
     let labels = args.labels.map(read_labels).transpose()?;
     match labels {
-        Some(labels) => run_guided_search(&mut poly, &labels),
+        Some(labels) => {
+            let writer_callback = Box::new(|rs_out: ReverseSearchOut| {
+                counter += 1;
+                info!("Writing guided result {}", counter);
+                let decomp = rs_out.minkowski_decomp_iter().collect_vec();
+                let matches: u32 = labels.iter().zip_eq(&decomp).map(|(l, d)| {
+                    if *l == *d {
+                        1u32
+                    }else {
+                        0u32
+                    }
+                }).sum();
+                let output = Output {
+                    param: &rs_out.param,
+                    minkowski_decomp: &decomp,
+                    accuracy: matches as f32 / labels.len() as f32,
+                };
+                let out_string = serde_json::to_string(&output)? + "\n";
+                writer.write(out_string.as_bytes())?;
+                writer.flush()?;
+                return Ok(());
+            
+        });
+        run_guided_search(&mut poly, &labels, writer_callback)
+        }
         None => {
-            let mut counter = 0;
             let writer_callback = Box::new(|rs_out: ReverseSearchOut| {
                 counter += 1;
                 info!("Writing result {}", counter);
@@ -210,6 +244,7 @@ fn main() -> Result<()> {
                 };
                 let out_string = serde_json::to_string(&output)? + "\n";
                 writer.write(out_string.as_bytes())?;
+                writer.flush()?;
                 return Ok(());
             });
 

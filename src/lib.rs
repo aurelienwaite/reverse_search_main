@@ -1,22 +1,20 @@
 use anyhow::{anyhow, Result};
+use futures::task::WakerRef;
+use serde_json::map::Iter;
 use core::future::Future;
 use futures::{executor, task};
 use futures::{
     future::{BoxFuture, FutureExt},
-    stream::Stream,
     task::{waker_ref, ArcWake},
-    StreamExt,
 };
 use itertools::Itertools;
 use log::{debug, info};
 use reverse_search::guided_search::{search_wrapper, Executor, Guide};
 use reverse_search::{ReverseSearchOut, Searcher, StepResult, TreeIndex};
-use std::borrow::BorrowMut;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::process::Output;
 use std::rc::Rc;
 use std::task::{Poll, Wake, Waker};
 use std::{
@@ -66,46 +64,115 @@ impl Future for StepFuture {
     }
 }
 
-pub struct GuideGenerator<'a> {
-    pub guide: Guide,
-    pub labels: &'a [usize],
+
+pub struct RSGen<'a> {
+    tasks: Vec<Pin<Box<dyn Future<Output = Result<Option<ReverseSearchOut>>> + 'a >>>,
+    concurrent_tasks: Rc<Cell<HashMap<Vec<TreeIndex>, Rc<RefCell<FutureState>>>>>,
+    receiver: Rc<mpsc::Receiver<(Vec<TreeIndex>, Result<StepResult>)>>,
+    wake: Arc<RSWake>,
+    batch_size: usize,
+    executor: Rc<Box<dyn Fn(Vec<TreeIndex>) -> Pin<Box<dyn Future<Output = Result<StepResult>> + 'a>> +'a>>,
+    guide: &'a Guide
 }
 
-impl GuideGenerator<'_> {
-    fn generate<'b>(
-        &'b self,
-        executor: Rc<
-            impl Fn(Vec<TreeIndex>) -> Pin<Box<dyn Future<Output = Result<StepResult>>>> + 'b,
-        >,
-    ) -> Option<Pin<Box<dyn Future<Output = Result<()>> + 'b>>> {
-        let guided = self.guide.guided_search(executor);
-        let future = async {
-            let output = guided.await;
-            match output {
-                Ok(step_result) => {
-                    if let Some(reverse_out) = step_result {
-                        let matches: usize = reverse_out
-                            .minkowski_decomp_iter()
-                            .zip_eq(self.labels)
-                            .map(|(a, b)| if a == *b { 1usize } else { 0usize })
-                            .sum();
-                        let accuracy = matches as f64 / self.labels.len() as f64;
-                        info!(
-                            "Got a guided result! {:?} with accuracy {}",
-                            reverse_out.minkowski_decomp_iter().collect_vec(),
-                            accuracy
-                        );
-                    } else {
-                        debug!("No result 😔");
-                    }
-                    Ok(())
-                }
-                Err(err) => Err(err),
-            }
+impl<'a> RSGen<'a> {
+    fn new(threadpool: &ThreadPool, guide: &'a Guide, batch_size: usize) -> Result<Self>{
+        let wake: Arc<RSWake> = Arc::new(RSWake {});
+
+        let tasks: Vec<Pin<Box<dyn Future<Output = Result<Option<ReverseSearchOut>>>>>> =
+            Vec::new();
+        let concurrent_tasks: Rc<Cell<HashMap<Vec<TreeIndex>, Rc<RefCell<FutureState>>>>> =
+            Rc::new(Cell::new(HashMap::new()));
+        let concurrent_tasks_ref = concurrent_tasks.clone();
+
+        let sender = threadpool.sender.as_ref().ok_or(anyhow!("No sender!"))?.clone();
+        let executor = move |path: Vec<TreeIndex>| {
+            sender.send(path.clone()).unwrap();
+            let state = FutureState {
+                result: None,
+                waker: None,
+            };
+            let state_ref = Rc::new(RefCell::new(state));
+            let mut concurrent_tasks = concurrent_tasks_ref.take();
+            concurrent_tasks.insert(path, state_ref.clone());
+            concurrent_tasks_ref.set(concurrent_tasks);
+            let future: Pin<Box<dyn Future<Output = Result<StepResult>>>> =
+                Box::pin(StepFuture { state: state_ref });
+            future
         };
-        let item = Box::pin(future);
-        Some(item)
+        let executor_ref: Rc<Box<dyn Fn(_) -> _ +'a>> = Rc::new(Box::new(executor));
+
+        let receiver = threadpool.receiver.as_ref().ok_or(anyhow!("No receiver!"))?.clone();
+        Ok(RSGen{
+            wake, tasks, concurrent_tasks, receiver, batch_size, executor: executor_ref, guide
+        })
+
     }
+
+    
+    fn iterative_search(&mut self) -> Option<Result<Vec<ReverseSearchOut>>> {
+        let waker = waker_ref(&self.wake);
+        let context = &mut Context::from_waker(&waker);
+
+        debug!("tasks len {}", self.tasks.len());
+        while self.tasks.len() < self.batch_size {
+            let mut future:Pin<Box<dyn Future<Output = Result<Option<ReverseSearchOut>>> +'a >> = Box::pin(self.guide.guided_search(self.executor.clone()));
+            match future.poll_unpin(context) {
+                Poll::Ready(_) => debug!("Poll ready"),
+                Poll::Pending => debug!("Poll pending"),
+            }
+            self.tasks.push(future);
+        }
+
+        // Received a message, unblock
+        let concurrent_tasks_taken = self.concurrent_tasks.take();
+        {
+            let result = self.
+                receiver.recv().map_err(|err| anyhow!(err)) // We block here
+                .and_then(|(key, res)| {
+                    concurrent_tasks_taken
+                        .get(&key)
+                        .map(|state| (state, res))
+                        .ok_or(anyhow!("Missing state key"))
+                })
+                .and_then(|(state, res)| {
+                    (**state)
+                        .try_borrow_mut()
+                        .map(|mut_ref| (mut_ref, res))
+                        .map_err(|err| anyhow!(err))
+                })
+                .and_then(|(mut mut_ref, res)| Ok(mut_ref.set_result(res)));
+            if let Err(err) = result{
+                return Some(Err(anyhow!(err)));
+            }
+        }
+        self.concurrent_tasks.set(concurrent_tasks_taken);
+
+        let (results, pending): (Vec<_>, Vec<_>) = self.tasks
+            .drain(0..self.tasks.len())
+            .map(|mut task| match task.poll_unpin(context) {
+                Poll::Ready(out) => (Some(out), None),
+                Poll::Pending => (None, Some(task)),
+            })
+            .unzip();
+        self.tasks.extend(pending.into_iter().filter_map(|t| t).collect_vec());
+
+        let result_res: Result<Vec<_>> = results.into_iter().filter_map(|r| r).collect();
+        Some(result_res.map(|res| res.into_iter().filter_map(|r| r).collect_vec()))
+
+    }
+
+    
+
+}
+
+impl Iterator for RSGen<'_>{
+    type Item = Result<Vec<ReverseSearchOut>>;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iterative_search()
+    }
+    
 }
 
 pub struct RSWake {}
@@ -119,7 +186,8 @@ impl ArcWake for RSWake {
 pub struct ThreadPool {
     workers: Vec<Worker>,
     sender: Option<Rc<mpsc::Sender<Vec<TreeIndex>>>>,
-    receiver: Option<mpsc::Receiver<(Vec<TreeIndex>, Result<StepResult>)>>,
+    receiver: Option<Rc<mpsc::Receiver<(Vec<TreeIndex>, Result<StepResult>)>>>,
+    
 }
 
 impl ThreadPool {
@@ -146,74 +214,18 @@ impl ThreadPool {
         ThreadPool {
             workers,
             sender: Some(Rc::new(guide_sender)),
-            receiver: Some(guide_receiver),
+            receiver: Some(Rc::new(guide_receiver)),
         }
     }
 
-    pub fn run<'a>(&self, futures: &GuideGenerator, batch_size: usize) -> Result<()> {
-        let wake: Arc<RSWake> = Arc::new(RSWake {});
-        let waker = waker_ref(&wake);
-        let context = &mut Context::from_waker(&waker);
+}
 
-        let mut tasks: Vec<Pin<Box<dyn Future<Output = Result<()>>>>> = Vec::new();
-        let concurrent_tasks: Rc<Cell<HashMap<Vec<TreeIndex>, Rc<RefCell<FutureState>>>>> =
-            Rc::new(Cell::new(HashMap::new()));
-        let concurrent_tasks_ref = concurrent_tasks.clone();
-
-        let sender = self.sender.as_ref().ok_or(anyhow!("No sender!"))?.clone();
-        let executor = move |path: Vec<TreeIndex>| {
-            sender.send(path.clone()).unwrap();
-            let state = FutureState {
-                result: None,
-                waker: None,
-            };
-            let state_ref = Rc::new(RefCell::new(state));
-            let mut concurrent_tasks = concurrent_tasks_ref.take();
-            concurrent_tasks.insert(path, state_ref.clone());
-            concurrent_tasks_ref.set(concurrent_tasks);
-            let future: Pin<Box<dyn Future<Output = Result<StepResult>>>> =
-                Box::pin(StepFuture { state: state_ref });
-            future
-        };
-        let executor_ref = Rc::new(executor);
-
-        loop {
-            while tasks.len() < batch_size {
-                if let Some(mut future) = futures.generate(executor_ref.clone()) {
-                    match future.poll_unpin(context) {
-                        Poll::Ready(_) => debug!("Poll ready"),
-                        Poll::Pending => debug!("Poll pending"),
-                    }
-                    tasks.push(future);
-                } else {
-                    return Ok(());
-                }
-            }
-
-            // We block here
-            let receiver = self.receiver.as_ref().ok_or(anyhow!("No receiver"))?;
-            // Received a message, unblock
-            let (key, res) = receiver.recv()?;
-            let concurrent_tasks_taken = concurrent_tasks.take();
-            {
-                let state = concurrent_tasks_taken
-                    .get(&key)
-                    .ok_or(anyhow!("Missing state key"))?;
-                let mut mut_ref = (**state).try_borrow_mut()?;
-                mut_ref.set_result(res);
-            }
-            concurrent_tasks.set(concurrent_tasks_taken);
-
-            let filtered = tasks
-                .drain(0..tasks.len())
-                .filter_map(|mut task| match task.poll_unpin(context) {
-                    Poll::Ready(_) => None,
-                    Poll::Pending => Some(task),
-                })
-                .collect_vec();
-            tasks.extend(filtered);
-        }
-    }
+pub fn runner<'a>(
+    tp: &'a ThreadPool,
+    guide: &'a Guide,
+    batch_size: usize,
+) -> Result<RSGen<'a>> {
+    RSGen::new(&tp, guide, batch_size)
 }
 
 impl Drop for ThreadPool {
@@ -222,7 +234,7 @@ impl Drop for ThreadPool {
         drop(self.receiver.take());
 
         for worker in &mut self.workers {
-            println!("Shutting down worker {}", worker.id);
+            info!("Shutting down worker {}", worker.id);
 
             if let Some(thread) = worker.thread.take() {
                 thread.join().unwrap();
