@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Result};
-use futures::task::WakerRef;
-use serde_json::map::Iter;
 use core::future::Future;
+use futures::task::WakerRef;
 use futures::{executor, task};
 use futures::{
     future::{BoxFuture, FutureExt},
@@ -11,12 +10,14 @@ use itertools::Itertools;
 use log::{debug, info};
 use reverse_search::guided_search::{search_wrapper, Executor, Guide};
 use reverse_search::{ReverseSearchOut, Searcher, StepResult, TreeIndex};
+use serde_json::map::Iter;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Poll, Wake, Waker};
+use std::time;
 use std::{
     pin::pin,
     sync::{mpsc, Arc, Mutex},
@@ -24,6 +25,8 @@ use std::{
 };
 use std::{thread_local, vec};
 use task::Context;
+
+const ten_secs: time::Duration = time::Duration::from_secs(10);
 
 thread_local! {
     static SEARCH: RefCell<Option<Searcher>> = RefCell::new(None);
@@ -64,19 +67,20 @@ impl Future for StepFuture {
     }
 }
 
-
 pub struct RSGen<'a> {
-    tasks: Vec<Pin<Box<dyn Future<Output = Result<Option<ReverseSearchOut>>> + 'a >>>,
+    tasks: Vec<Pin<Box<dyn Future<Output = Result<Option<ReverseSearchOut>>> + 'a>>>,
     concurrent_tasks: Rc<Cell<HashMap<Vec<TreeIndex>, Rc<RefCell<FutureState>>>>>,
     receiver: Rc<mpsc::Receiver<(Vec<TreeIndex>, Result<StepResult>)>>,
     wake: Arc<RSWake>,
     batch_size: usize,
-    executor: Rc<Box<dyn Fn(Vec<TreeIndex>) -> Pin<Box<dyn Future<Output = Result<StepResult>> + 'a>> +'a>>,
-    guide: &'a Guide
+    executor: Rc<
+        Box<dyn Fn(Vec<TreeIndex>) -> Pin<Box<dyn Future<Output = Result<StepResult>> + 'a>> + 'a>,
+    >,
+    guide: &'a Guide,
 }
 
 impl<'a> RSGen<'a> {
-    fn new(threadpool: &ThreadPool, guide: &'a Guide, batch_size: usize) -> Result<Self>{
+    fn new(threadpool: &ThreadPool, guide: &'a Guide, batch_size: usize) -> Result<Self> {
         let wake: Arc<RSWake> = Arc::new(RSWake {});
 
         let tasks: Vec<Pin<Box<dyn Future<Output = Result<Option<ReverseSearchOut>>>>>> =
@@ -85,7 +89,11 @@ impl<'a> RSGen<'a> {
             Rc::new(Cell::new(HashMap::new()));
         let concurrent_tasks_ref = concurrent_tasks.clone();
 
-        let sender = threadpool.sender.as_ref().ok_or(anyhow!("No sender!"))?.clone();
+        let sender: Rc<mpsc::Sender<Vec<TreeIndex>>> = threadpool
+            .sender
+            .as_ref()
+            .ok_or(anyhow!("No sender!"))?
+            .clone();
         let executor = move |path: Vec<TreeIndex>| {
             sender.send(path.clone()).unwrap();
             let state = FutureState {
@@ -94,29 +102,41 @@ impl<'a> RSGen<'a> {
             };
             let state_ref = Rc::new(RefCell::new(state));
             let mut concurrent_tasks = concurrent_tasks_ref.take();
-            concurrent_tasks.insert(path, state_ref.clone());
+            let old_val = concurrent_tasks.insert(path, state_ref.clone());
+            if let Some(_) = old_val {
+                info!("Dupe key");
+            }
             concurrent_tasks_ref.set(concurrent_tasks);
             let future: Pin<Box<dyn Future<Output = Result<StepResult>>>> =
                 Box::pin(StepFuture { state: state_ref });
             future
         };
-        let executor_ref: Rc<Box<dyn Fn(_) -> _ +'a>> = Rc::new(Box::new(executor));
+        let executor_ref: Rc<Box<dyn Fn(_) -> _ + 'a>> = Rc::new(Box::new(executor));
 
-        let receiver = threadpool.receiver.as_ref().ok_or(anyhow!("No receiver!"))?.clone();
-        Ok(RSGen{
-            wake, tasks, concurrent_tasks, receiver, batch_size, executor: executor_ref, guide
+        let receiver = threadpool
+            .receiver
+            .as_ref()
+            .ok_or(anyhow!("No receiver!"))?
+            .clone();
+        Ok(RSGen {
+            wake,
+            tasks,
+            concurrent_tasks,
+            receiver,
+            batch_size,
+            executor: executor_ref,
+            guide,
         })
-
     }
 
-    
     fn iterative_search(&mut self) -> Option<Result<Vec<ReverseSearchOut>>> {
         let waker = waker_ref(&self.wake);
         let context = &mut Context::from_waker(&waker);
 
         debug!("tasks len {}", self.tasks.len());
         while self.tasks.len() < self.batch_size {
-            let mut future:Pin<Box<dyn Future<Output = Result<Option<ReverseSearchOut>>> +'a >> = Box::pin(self.guide.guided_search(self.executor.clone()));
+            let mut future: Pin<Box<dyn Future<Output = Result<Option<ReverseSearchOut>>> + 'a>> =
+                Box::pin(self.guide.guided_search(self.executor.clone()));
             match future.poll_unpin(context) {
                 Poll::Ready(_) => debug!("Poll ready"),
                 Poll::Pending => debug!("Poll pending"),
@@ -124,58 +144,82 @@ impl<'a> RSGen<'a> {
             self.tasks.push(future);
         }
 
-        // Received a message, unblock
-        let concurrent_tasks_taken = self.concurrent_tasks.take();
-        {
-            let result = self.
-                receiver.recv().map_err(|err| anyhow!(err)) // We block here
-                .and_then(|(key, res)| {
-                    concurrent_tasks_taken
-                        .get(&key)
-                        .map(|state| (state, res))
-                        .ok_or(anyhow!("Missing state key"))
-                })
-                .and_then(|(state, res)| {
-                    (**state)
-                        .try_borrow_mut()
-                        .map(|mut_ref| (mut_ref, res))
-                        .map_err(|err| anyhow!(err))
-                })
-                .and_then(|(mut mut_ref, res)| Ok(mut_ref.set_result(res)));
-            if let Err(err) = result{
-                return Some(Err(anyhow!(err)));
+
+        let mut processed: Vec<
+            std::result::Result<(Vec<TreeIndex>, Result<StepResult, _>), mpsc::RecvError>,
+        > = Vec::new();
+        debug!("Blocking whilst waiting for results");
+        //thread::sleep(ten_secs);
+        processed.push(self.receiver.recv()); // We block here
+        loop {
+            let received = self.receiver.try_recv();
+            match received {
+                Ok(msg) => processed.push(Ok(msg)),
+                Err(err) => match err {
+                    mpsc::TryRecvError::Empty => break,
+                    mpsc::TryRecvError::Disconnected => {
+                        processed.push(Err(mpsc::RecvError));
+                        break;
+                    }
+                },
             }
         }
-        self.concurrent_tasks.set(concurrent_tasks_taken);
 
-        let (results, pending): (Vec<_>, Vec<_>) = self.tasks
+        let processed_transposed : Result<Vec<_>, _> = processed.into_iter().collect();
+        match processed_transposed {
+            Ok(step_results) => {
+                debug!("Processed {}", step_results.len());
+                let concurrent_tasks_taken = self.concurrent_tasks.take();
+                for (key, step_result) in step_results {
+                    let state_set_res = concurrent_tasks_taken
+                    .get(&key)
+                    .ok_or(anyhow!("Missing state key"))
+                    .and_then(|state| {
+                        (**state)
+                            .try_borrow_mut()
+                            .map_err(|err| anyhow!(err))
+                    })
+                    .and_then(|mut mut_ref| {
+                        Ok(mut_ref.set_result(step_result))
+                    });
+                    if let Err(err) = state_set_res {
+                        return Some(Err(anyhow!(err)));
+                    }
+                }
+                self.concurrent_tasks.set(concurrent_tasks_taken);
+            }
+            Err(err) => return Some(Err(anyhow!(err))),
+        }
+
+
+
+        let (results, pending): (Vec<_>, Vec<_>) = self
+            .tasks
             .drain(0..self.tasks.len())
             .map(|mut task| match task.poll_unpin(context) {
                 Poll::Ready(out) => (Some(out), None),
                 Poll::Pending => (None, Some(task)),
             })
             .unzip();
-        self.tasks.extend(pending.into_iter().filter_map(|t| t).collect_vec());
-
+        self.tasks
+            .extend(pending.into_iter().filter_map(|t| t).collect_vec());
+        debug!("Still processing {}", self.tasks.len());
         let result_res: Result<Vec<_>> = results.into_iter().filter_map(|r| r).collect();
         Some(result_res.map(|res| res.into_iter().filter_map(|r| r).collect_vec()))
-
     }
-
-    
-
 }
 
-impl Iterator for RSGen<'_>{
+impl Iterator for RSGen<'_> {
     type Item = Result<Vec<ReverseSearchOut>>;
-    
+
     fn next(&mut self) -> Option<Self::Item> {
         self.iterative_search()
     }
-    
 }
 
-pub struct RSWake {}
+pub struct RSWake {
+
+}
 
 impl ArcWake for RSWake {
     fn wake_by_ref(_arc_self: &Arc<Self>) {
@@ -187,7 +231,6 @@ pub struct ThreadPool {
     workers: Vec<Worker>,
     sender: Option<Rc<mpsc::Sender<Vec<TreeIndex>>>>,
     receiver: Option<Rc<mpsc::Receiver<(Vec<TreeIndex>, Result<StepResult>)>>>,
-    
 }
 
 impl ThreadPool {
@@ -217,14 +260,9 @@ impl ThreadPool {
             receiver: Some(Rc::new(guide_receiver)),
         }
     }
-
 }
 
-pub fn runner<'a>(
-    tp: &'a ThreadPool,
-    guide: &'a Guide,
-    batch_size: usize,
-) -> Result<RSGen<'a>> {
+pub fn runner<'a>(tp: &'a ThreadPool, guide: &'a Guide, batch_size: usize) -> Result<RSGen<'a>> {
     RSGen::new(&tp, guide, batch_size)
 }
 
@@ -255,15 +293,20 @@ impl Worker {
         sender: Arc<Mutex<mpsc::Sender<(Vec<TreeIndex>, Result<StepResult>)>>>,
         search: Arc<Searcher>,
     ) -> Worker {
-        let thread = thread::spawn(move || loop {
+        let thread = thread::spawn(move || {
             SEARCH.with_borrow_mut(|search_opt| {
                 assert!(search_opt.is_none());
                 search_opt.replace(search.as_ref().clone())
             });
 
             loop {
+                //thread::sleep(hundred_millis);
                 let message = receiver.lock().unwrap().recv();
 
+                /*if id == 2{
+                    info!("sleeping");
+                    thread::sleep(ten_sec);
+                }*/
                 let res = match message {
                     Ok(node_path) => {
                         debug!("Worker {id} got a job; executing.");

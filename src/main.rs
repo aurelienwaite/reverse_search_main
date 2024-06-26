@@ -161,11 +161,17 @@ fn run_guided_search(
     let search = Searcher::setup_reverse_search(polys)?;
     let thread_pool = ThreadPool::new(4, search.clone());
     let guide = Guide::new(&search, labels, Some(42))?;
-    let runner_res = runner(&thread_pool, &guide, 20)?;
+    let runner_res = runner(&thread_pool, &guide, 1000)?;
+    let mut count = 0usize;
     for outputs in runner_res {
         for output in outputs? {
             writer_callback(output)?;
+            count += 1;
         }
+        if count > 1000 {
+            break;
+        }
+        
     }
     Ok(())
 }
