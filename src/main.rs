@@ -37,6 +37,9 @@ struct Args {
 
     #[arg(long)]
     reserve_search_out: String,
+
+    #[arg(long)]
+    num_states: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -152,6 +155,7 @@ fn run_guided_search(
     polys: &mut [Polytope],
     labels: &[usize],
     mut writer_callback: Box<impl FnMut(ReverseSearchOut) -> Result<()>>,
+    num_states: Option<usize>
 ) -> Result<()> {
     info!("Filling polytopes");
     for poly in &mut *polys {
@@ -168,10 +172,11 @@ fn run_guided_search(
             writer_callback(output)?;
             count += 1;
         }
-        if count > 1000 {
-            break;
-        }
-        
+        if let Some(bound) = num_states {
+            if count > bound {
+                break;
+            }    
+        }        
     }
     Ok(())
 }
@@ -230,7 +235,7 @@ fn main() -> Result<()> {
                 return Ok(());
             
         });
-        run_guided_search(&mut poly, &labels, writer_callback)
+        run_guided_search(&mut poly, &labels, writer_callback, args.num_states)
         }
         None => {
             let writer_callback = Box::new(|rs_out: ReverseSearchOut| {

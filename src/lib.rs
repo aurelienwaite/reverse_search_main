@@ -102,6 +102,7 @@ impl<'a> RSGen<'a> {
             };
             let state_ref = Rc::new(RefCell::new(state));
             let mut concurrent_tasks = concurrent_tasks_ref.take();
+            debug!("To insert {:?}", &path);
             let old_val = concurrent_tasks.insert(path, state_ref.clone());
             if let Some(_) = old_val {
                 info!("Dupe key");
@@ -137,11 +138,20 @@ impl<'a> RSGen<'a> {
         while self.tasks.len() < self.batch_size {
             let mut future: Pin<Box<dyn Future<Output = Result<Option<ReverseSearchOut>>> + 'a>> =
                 Box::pin(self.guide.guided_search(self.executor.clone()));
+            debug!("Tasks len {}", self.tasks.len());
             match future.poll_unpin(context) {
-                Poll::Ready(_) => debug!("Poll ready"),
-                Poll::Pending => debug!("Poll pending"),
+                Poll::Ready(res) => {
+                    debug!("Poll ready, probably a bug");
+                    let res_out = res.map(|rs_opt| {
+                        rs_opt.into_iter().collect::<Vec<_>>()
+                    });
+                    return Some(res_out);
+                },
+                Poll::Pending => {
+                    debug!("Poll pending");
+                    self.tasks.push(future);
+                },
             }
-            self.tasks.push(future);
         }
 
 
