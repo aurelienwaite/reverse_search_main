@@ -1,27 +1,34 @@
 use anyhow::{anyhow, Result};
 use clap::Parser;
-use core::future::Future;
-use futures::future::BoxFuture;
 use itertools::Itertools;
 use log::{debug, info};
 use ndarray::prelude::*;
-use parquet::file::reader::{FileReader, SerializedFileReader};
-use parquet::record::RowAccessor;
-use reverse_search::guided_search::Guide;
-use reverse_search::{reverse_search, Polytope, ReverseSearchOut, Searcher, StepResult, TreeIndex};
-use reverse_search_main::{runner, ThreadPool};
+use parquet::{
+    basic::{Repetition, Type as PhysicalType},
+    column::writer::ColumnWriter,
+    errors::ParquetError,
+    file::{
+        properties::WriterProperties,
+        reader::{FileReader, SerializedFileReader},
+        writer::SerializedFileWriter,
+    },
+    record::RowAccessor,
+    schema::types::Type,
+};
+use reverse_search::guided_search::{Guide, Scorer};
+use reverse_search::{reverse_search, Polytope, ReverseSearchOut, Searcher};
+use reverse_search_main::{runner, Accuracy, MeanAverageError, ThreadPool};
 use serde::{Deserialize, Serialize};
 use simplelog::*;
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::prelude::*;
-use std::io::BufReader;
-use std::io::BufWriter;
-use std::pin::{pin, Pin};
-use std::rc::Rc;
-use std::string::String;
-use std::vec::Vec;
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{prelude::*, BufReader, BufWriter},
+    rc::Rc,
+    string::String,
+    sync::Arc,
+    vec::Vec,
+};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -33,10 +40,16 @@ struct Args {
     labels: Option<String>,
 
     #[arg(long)]
+    responses: Option<String>,
+
+    #[arg(long)]
+    clusters: Option<String>,
+
+    #[arg(long)]
     polytope_out: String,
 
     #[arg(long)]
-    reserve_search_out: String,
+    reverse_search_out: String,
 
     #[arg(long)]
     num_states: Option<usize>,
@@ -49,9 +62,8 @@ struct InputPolytope {
 
 #[derive(Serialize, Debug)]
 struct Output<'a> {
-    param: &'a Array1<f64>,
     minkowski_decomp: &'a Vec<usize>,
-    accuracy: f32,
+    score: f64,
 }
 
 impl InputPolytope {
@@ -65,6 +77,10 @@ impl InputPolytope {
         }
         Ok(Polytope::new(array))
     }
+}
+
+fn make_scorer<'a>(scorer: impl Scorer + 'a) -> Rc<dyn Scorer + 'a> {
+    Rc::new(scorer)
 }
 
 fn populate_string(filename: String) -> Result<String> {
@@ -90,6 +106,65 @@ fn read_labels(labels_filename: String) -> Result<Vec<usize>> {
     let contents = populate_string(labels_filename)?;
     let deserialised: Vec<usize> = serde_json::from_str(&contents)?;
     Ok(deserialised)
+}
+
+fn read_responses(responses_filename: String) -> Result<(Vec<usize>, Array1<f64>)> {
+    let responses_file = File::open(responses_filename)?;
+    let reader = SerializedFileReader::new(responses_file)?;
+    let parquet_metadata = reader.metadata();
+    let fields = parquet_metadata.file_metadata().schema().get_fields();
+    let mut cluster_id_pos_opt: Option<usize> = None;
+    let mut response_pos_opt: Option<usize> = None;
+    for (pos, column) in fields.iter().enumerate() {
+        match column.name() {
+            "Cluster_ID" => Ok(cluster_id_pos_opt = Some(pos)),
+            "Response" => Ok(response_pos_opt = Some(pos)),
+            unknown => Err(anyhow!("Unknown column: {}", unknown)),
+        }?
+    }
+    let cluster_id_pos = cluster_id_pos_opt.ok_or(anyhow!("No cluster id in schema"))?;
+    let response_pos = response_pos_opt.ok_or(anyhow!("No response in schema"))?;
+
+    let mut labels: Vec<usize> = Vec::new();
+    let mut responses: Vec<f64> = Vec::new();
+    let mut iter = reader.get_row_iter(None)?;
+    while let Some(record_res) = iter.next() {
+        let record = record_res?;
+        labels.push(record.get_int(cluster_id_pos)?.try_into()?);
+        responses.push(record.get_double(response_pos)?);
+    }
+    Ok((labels, Array::from_vec(responses)))
+}
+
+fn read_clusters(responses_filename: String) -> Result<Array1<f64>> {
+    let responses_file = File::open(responses_filename)?;
+    let reader = SerializedFileReader::new(responses_file)?;
+    let parquet_metadata = reader.metadata();
+    let fields = parquet_metadata.file_metadata().schema().get_fields();
+    let mut cluster_id_pos_opt: Option<usize> = None;
+    let mut cluster_val_pos_opt: Option<usize> = None;
+    for (pos, column) in fields.iter().enumerate() {
+        match column.name() {
+            "cluster_id" => Ok(cluster_id_pos_opt = Some(pos)),
+            "cluster_value" => Ok(cluster_val_pos_opt = Some(pos)),
+            unknown => Err(anyhow!("Unknown column: {}", unknown)),
+        }?
+    }
+    let cluster_id_pos = cluster_id_pos_opt.ok_or(anyhow!("No cluster id in schema"))?;
+    let response_pos = cluster_val_pos_opt.ok_or(anyhow!("No response in schema"))?;
+
+    let mut clusters: HashMap<usize, f64> = HashMap::new();
+    let mut iter = reader.get_row_iter(None)?;
+    while let Some(record_res) = iter.next() {
+        let record = record_res?;
+        let label: usize = record.get_int(cluster_id_pos)?.try_into()?;
+        clusters.insert(label, record.get_double(response_pos)?);
+    }
+    let mut cluster_ary = Array1::<f64>::zeros(clusters.len());
+    for (cluster_id, cluster_val) in clusters {
+        cluster_ary[cluster_id] = cluster_val;
+    }
+    Ok(cluster_ary)
 }
 
 fn read_parquet_polytope(poly_str: String) -> Result<Vec<Polytope>> {
@@ -118,7 +193,7 @@ fn read_parquet_polytope(poly_str: String) -> Result<Vec<Polytope>> {
     let (mut max_p, mut max_v, mut max_d) = (0_usize, 0_usize, 0_usize);
 
     let mut values: Vec<f64> = Vec::new();
-    let mut iter = reader.get_row_iter(None).unwrap();
+    let mut iter = reader.get_row_iter(None)?;
     while let Some(record_res) = iter.next() {
         let record = record_res?;
         max_p = max_p.max(record.get_int(*p_pos)?.try_into()?);
@@ -152,20 +227,14 @@ fn write_polytope(poly_str: &Vec<FullPolytope>, out_filename: &String) -> Result
 }*/
 
 fn run_guided_search(
-    polys: &mut [Polytope],
-    labels: &[usize],
+    search: &Searcher,
+    guide: &Guide,
     mut writer_callback: Box<impl FnMut(ReverseSearchOut) -> Result<()>>,
-    num_states: Option<usize>
+    num_states: Option<usize>,
 ) -> Result<()> {
-    info!("Filling polytopes");
-    for poly in &mut *polys {
-        poly.fill()?;
-    }
     info!("Starting search");
-    let search = Searcher::setup_reverse_search(polys)?;
     let thread_pool = ThreadPool::new(4, search.clone());
-    let guide = Guide::new(&search, labels, Some(42))?;
-    let runner_res = runner(&thread_pool, &guide, 50)?;
+    let runner_res = runner(&thread_pool, &guide, 1000)?;
     let mut count = 0usize;
     for outputs in runner_res {
         for output in outputs? {
@@ -175,8 +244,8 @@ fn run_guided_search(
         if let Some(bound) = num_states {
             if count > bound {
                 break;
-            }    
-        }        
+            }
+        }
     }
     Ok(())
 }
@@ -205,53 +274,104 @@ fn main() -> Result<()> {
         _ => Err(anyhow!("Unknown suffix {}", suffix)),
     }?;
 
-    info!("Saving search results to {}", &args.reserve_search_out);
-    let states_out_file = File::create(&args.reserve_search_out)?;
+    info!("Saving search results to {}", &args.reverse_search_out);
+    let states_out_jsonl = format!("{}.jsonl", args.reverse_search_out);
+    let states_out_file = File::create(&states_out_jsonl)?;
     let mut writer = BufWriter::new(states_out_file);
 
-    let mut counter = 0;
+    let states_out_parquet = format!("{}.parquet", args.reverse_search_out);
+    let params_file = File::create(&states_out_parquet)?;
+    let dim = poly
+        .first()
+        .ok_or(anyhow!("No polytopes!"))?
+        .vertices
+        .shape()[1];
+    let fields = (0..dim)
+        .into_iter()
+        .map(|i| {
+            Type::primitive_type_builder(format!("parameter_{}", i).as_str(), PhysicalType::DOUBLE)
+                .with_repetition(Repetition::REQUIRED)
+                .build()
+        })
+        .collect::<Result<Vec<_>, ParquetError>>()?;
+    let schema = Arc::new(
+        Type::group_type_builder("schema")
+            .with_fields(fields.into_iter().map(|f| Arc::new(f)).collect_vec())
+            .build()?,
+    );
+    let props = Arc::new(WriterProperties::builder().build());
+    let mut parquet_writer = SerializedFileWriter::new(params_file, schema, props)?;
+
     let labels = args.labels.map(read_labels).transpose()?;
-    match labels {
-        Some(labels) => {
+    let responses = args.responses.map(read_responses).transpose()?;
+    let clusters = args.clusters.map(read_clusters).transpose()?;
+
+    let scorer: Option<Rc<dyn Scorer>> = match (labels, responses, clusters) {
+        (Some(inner_labels), None, None) => Ok(Some(make_scorer(Accuracy::new(inner_labels)))),
+        (None, Some((_, responses)), Some(cluster_ids)) => Ok(Some(make_scorer(
+            MeanAverageError::new(cluster_ids, responses),
+        ))),
+        (None, None, None) => Ok(None),
+        _ => Err(anyhow!("Need to supply labels, or clusters and responses")),
+    }?;
+
+    info!("Filling polytopes");
+    for poly in &mut *poly {
+        poly.fill()?;
+    }
+
+    let mut counter = 0;
+    match scorer {
+        Some(scorer) => {
+            let search = Searcher::setup_reverse_search(&poly)?;
+            let guide = Guide::new(&search, scorer.clone(), Some(42))?;
             let writer_callback = Box::new(|rs_out: ReverseSearchOut| {
                 counter += 1;
                 info!("Writing guided result {}", counter);
-                let decomp = rs_out.minkowski_decomp_iter().collect_vec();
-                let matches: u32 = labels.iter().zip_eq(&decomp).map(|(l, d)| {
-                    if *l == *d {
-                        1u32
-                    }else {
-                        0u32
+                {
+                    let mut row_group_writer = parquet_writer.next_row_group()?;
+                    for param in &rs_out.param {
+                        let col_writer = row_group_writer.next_column()?;
+                        if let Some(mut inner_col_writer) = col_writer {
+                            if let ColumnWriter::DoubleColumnWriter(ref mut typed) =
+                                inner_col_writer.untyped()
+                            {
+                                let values = vec![*param];
+                                let written = typed.write_batch(&values, None, None)?;
+                                assert!(written == 1, "written was {}", written);
+                            } else {
+                                return Err(anyhow!("Unexpected column writer"));
+                            }
+                            inner_col_writer.close()?;
+                        } else {
+                            return Err(anyhow!("No column writer"));
+                        }
                     }
-                }).sum();
+                    row_group_writer.close()?;
+                }
+                let decomp =  guide.map_polytope_indices(rs_out.minkowski_decomp_iter()).collect_vec();
+                let accuracy = -1. * scorer.score(Box::new(decomp.iter().map(|v| *v)));
                 let output = Output {
-                    param: &rs_out.param,
                     minkowski_decomp: &decomp,
-                    accuracy: matches as f32 / labels.len() as f32,
+                    score: accuracy,
                 };
                 let out_string = serde_json::to_string(&output)? + "\n";
                 writer.write(out_string.as_bytes())?;
                 writer.flush()?;
                 return Ok(());
-            
-        });
-        run_guided_search(&mut poly, &labels, writer_callback, args.num_states)
+            });
+            run_guided_search(&search, &guide, writer_callback, args.num_states)?;
+            parquet_writer.close()?;
+            Ok(())
         }
         None => {
             let writer_callback = Box::new(|rs_out: ReverseSearchOut| {
                 counter += 1;
                 info!("Writing result {}", counter);
-                let accuracy = None
-                    .map(|l: &[usize]| {
-                        1.
-                        //accuracy(&rs_out.minkowski_decomp, l)
-                    })
-                    .unwrap_or(-1.);
                 let decomp = rs_out.minkowski_decomp_iter().collect_vec();
                 let output = Output {
-                    param: &rs_out.param,
                     minkowski_decomp: &decomp,
-                    accuracy: accuracy,
+                    score: 1.,
                 };
                 let out_string = serde_json::to_string(&output)? + "\n";
                 writer.write(out_string.as_bytes())?;
@@ -261,6 +381,7 @@ fn main() -> Result<()> {
 
             reverse_search(&mut poly, writer_callback)?;
             //write_polytope(&poly, &args.polytope_out)?;
+            parquet_writer.close()?;
             Ok(())
         }
     }

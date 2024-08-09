@@ -1,35 +1,70 @@
 use anyhow::{anyhow, Result};
 use core::future::Future;
-use futures::task::WakerRef;
-use futures::{executor, task};
 use futures::{
-    future::{BoxFuture, FutureExt},
+    task,
+    future::FutureExt,
     task::{waker_ref, ArcWake},
 };
 use itertools::Itertools;
 use log::{debug, info};
-use reverse_search::guided_search::{search_wrapper, Executor, Guide};
+use reverse_search::guided_search::{search_wrapper, Guide, Scorer};
 use reverse_search::{ReverseSearchOut, Searcher, StepResult, TreeIndex};
-use serde_json::map::Iter;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::task::{Poll, Wake, Waker};
-use std::time;
+use std::task::{Poll, Waker};
 use std::{
-    pin::pin,
     sync::{mpsc, Arc, Mutex},
     thread,
 };
-use std::{thread_local, vec};
+use std::thread_local;
 use task::Context;
+use ndarray::prelude::*;
 
-const ten_secs: time::Duration = time::Duration::from_secs(10);
 
 thread_local! {
     static SEARCH: RefCell<Option<Searcher>> = RefCell::new(None);
+}
+
+pub struct Accuracy{
+    labels: Vec<usize>
+}
+
+impl Scorer for Accuracy{
+    fn score<'a>(&self, to_score: Box<dyn Iterator<Item = usize> + 'a>) -> f64 {
+        let matches: usize = self.labels.iter()
+        .zip_eq(to_score)
+        .map(|(l, d)| if *l == d { 1usize } else { 0usize })
+        .sum();
+        matches as f64 / self.labels.len() as f64
+    }
+}
+
+impl Accuracy{
+    pub fn new(labels: Vec<usize>) -> Self{
+        Accuracy{labels}
+    }    
+}
+
+pub struct MeanAverageError{
+    cluster_values: Array1<f64>,
+    responses: Array1<f64>,
+}
+
+impl Scorer for MeanAverageError{
+    fn score<'a>(&self, to_score: Box<dyn Iterator<Item = usize> + 'a>) -> f64 {
+        let prediction: Array1<f64> = to_score.map(|cluster| self.cluster_values[cluster]).collect();
+        let mae = (prediction - self.responses.view()).mapv(f64::abs).mean().unwrap_or(0.);
+        mae * -1.
+    }
+}
+
+impl MeanAverageError{
+    pub fn new(cluster_values: Array1<f64>, responses: Array1<f64>) -> Self{
+        MeanAverageError{cluster_values, responses}
+    }    
 }
 
 struct FutureState {
