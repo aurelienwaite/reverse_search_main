@@ -15,6 +15,7 @@ use parquet::{
     record::RowAccessor,
     schema::types::Type,
 };
+use rayon::prelude::*;
 use reverse_search::guided_search::{Guide, Scorer};
 use reverse_search::{reverse_search, Polytope, ReverseSearchOut, Searcher};
 use reverse_search_main::{runner, Accuracy, MeanAverageError, ThreadPool};
@@ -234,7 +235,7 @@ fn run_guided_search(
 ) -> Result<()> {
     info!("Starting search");
     let thread_pool = ThreadPool::new(4, search.clone());
-    let runner_res = runner(&thread_pool, &guide, 1000)?;
+    let runner_res = runner(&thread_pool, &guide, 10)?;
     let mut count = 0usize;
     for outputs in runner_res {
         for output in outputs? {
@@ -242,7 +243,7 @@ fn run_guided_search(
             count += 1;
         }
         if let Some(bound) = num_states {
-            if count > bound {
+            if count >= bound {
                 break;
             }
         }
@@ -267,7 +268,7 @@ fn main() -> Result<()> {
         .split(".")
         .last()
         .ok_or(anyhow!("No file suffix {}", args.polytope_file))?;
-    let mut poly = match suffix {
+    let poly = match suffix {
         "json" => read_polytope(args.polytope_file),
         "jsn" => read_polytope(args.polytope_file),
         "parquet" => read_parquet_polytope(args.polytope_file),
@@ -315,15 +316,17 @@ fn main() -> Result<()> {
         _ => Err(anyhow!("Need to supply labels, or clusters and responses")),
     }?;
 
+    
     info!("Filling polytopes");
-    for poly in &mut *poly {
-        poly.fill()?;
-    }
+    let mut filled = poly.into_par_iter().map(|mut p|  {
+        p.fill().map(|_| p)
+    }).collect::<Result<Vec<_>>>()?;
+    
 
     let mut counter = 0;
     match scorer {
         Some(scorer) => {
-            let search = Searcher::setup_reverse_search(&poly)?;
+            let search = Searcher::setup_reverse_search(&filled)?;
             let guide = Guide::new(&search, scorer.clone(), Some(42))?;
             let writer_callback = Box::new(|rs_out: ReverseSearchOut| {
                 counter += 1;
@@ -379,7 +382,7 @@ fn main() -> Result<()> {
                 return Ok(());
             });
 
-            reverse_search(&mut poly, writer_callback)?;
+            reverse_search(&mut filled, writer_callback)?;
             //write_polytope(&poly, &args.polytope_out)?;
             parquet_writer.close()?;
             Ok(())
