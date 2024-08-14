@@ -193,27 +193,28 @@ fn read_parquet_polytope(poly_str: String) -> Result<Vec<Polytope>> {
 
     let (mut max_p, mut max_v, mut max_d) = (0_usize, 0_usize, 0_usize);
 
-    let mut values: Vec<f64> = Vec::new();
+    let mut values: Vec<(usize, usize, usize, f64)> = Vec::new();
     let mut iter = reader.get_row_iter(None)?;
     while let Some(record_res) = iter.next() {
         let record = record_res?;
-        max_p = max_p.max(record.get_int(*p_pos)?.try_into()?);
-        max_v = max_v.max(record.get_int(*v_pos)?.try_into()?);
-        max_d = max_d.max(record.get_int(*d_pos)?.try_into()?);
-        values.push(record.get_double(*va_pos)?);
+        let p_value: usize = record.get_int(*p_pos)?.try_into()?;
+        max_p = max_p.max(p_value);
+        let v_value: usize = record.get_int(*v_pos)?.try_into()?;
+        max_v = max_v.max(v_value);
+        let d_value: usize = record.get_int(*d_pos)?.try_into()?;
+        max_d = max_d.max(d_value);
+        let datum: f64 = record.get_double(*va_pos)?;
+        values.push((p_value, v_value, d_value, datum));
     }
-    let mut polytopes: Vec<Polytope> = Vec::new();
-    for p in 0..(max_p + 1) {
-        let mut vertices = Array2::<f64>::zeros((max_v + 1, max_d + 1));
-        for v in 0..(max_v + 1) {
-            for d in 0..(max_d + 1) {
-                vertices[[v, d]] = values[p * (max_v + 1) * (max_d + 1) + v * (max_d + 1) + d]
-            }
-        }
-        //info!("vertices {:?}", vertices);
-        polytopes.push(Polytope::new(vertices));
+    let mut raw_arrays: Vec<Array2<f64>> = Vec::new();
+    for _p in 0..(max_p + 1) {
+        let vertices = Array2::<f64>::zeros((max_v + 1, max_d + 1));
+        raw_arrays.push(vertices);
     }
-
+    for (polytope, vertex, dim, datum) in values{
+        raw_arrays[polytope][[vertex, dim]] = datum;
+    }
+    let polytopes = raw_arrays.into_iter().map(Polytope::new).collect_vec();
     Ok(polytopes)
 }
 
