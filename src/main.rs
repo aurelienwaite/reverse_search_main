@@ -206,6 +206,7 @@ fn read_parquet_polytope(poly_str: String) -> Result<Vec<Polytope>> {
         let datum: f64 = record.get_double(*va_pos)?;
         values.push((p_value, v_value, d_value, datum));
     }
+    debug!("Max p: {}, max v {}, max d{}", max_p, max_v, max_d);
     let mut raw_arrays: Vec<Array2<f64>> = Vec::new();
     for _p in 0..(max_p + 1) {
         let vertices = Array2::<f64>::zeros((max_v + 1, max_d + 1));
