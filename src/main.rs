@@ -255,7 +255,7 @@ fn run_guided_search(
 
 fn main() -> Result<()> {
     TermLogger::init(
-        LevelFilter::Info,
+        LevelFilter::Debug,
         Config::default(),
         TerminalMode::Stdout,
         ColorChoice::Auto,
